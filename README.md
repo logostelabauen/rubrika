@@ -169,10 +169,11 @@ Every evaluated document is strictly validated against `GradingOutputSchema` (`s
    SIMILARITY_THRESHOLD=0.80
    ```
 
-3. **Install Dependencies & Typecheck**
+3. **Install Dependencies, Typecheck, & Run Unit Tests**
    ```bash
    npm install
    npm run check
+   npm run test
    ```
 
 4. **Initialize Database (Optional for Local Persistence)**
@@ -188,21 +189,41 @@ Every evaluated document is strictly validated against `GradingOutputSchema` (`s
 
 ---
 
+## Security Hardening & Quality Assurance
+
+Rubrika implements an 8-stage QA & Security Hardening pipeline verified by **22 automated Vitest unit tests** (`src/lib/__tests__/`):
+
+* **Indirect Prompt Injection Defense:** Wraps student text inside `<student_submission>...</student_submission>` XML tags, escapes closing tag breakout attempts (`sanitizeStudentSubmissionText`), and enforces strict untrusted-data system instructions.
+* **Empty Document Pre-Filter (Zero Token Cost):** Documents with $< 20$ words (e.g., blank files or unindexed image scans) automatically bypass Gemini API calls and receive a deterministic `0` score at zero token cost.
+* **Token Exhaustion Guard:** Hard-truncates extracted document text at `30,000` characters (`truncateDocumentText`) prior to LLM inference.
+* **ZIP Bomb & DoS Protection:** Enforces strict archive limits (`MAX_ZIP_ENTRIES = 100` files per `.zip` and `MAX_EXTRACTED_FILE_BYTES = 5 MB` per file via `maxOutputLength`).
+* **Atomic Credit Settlement & Auto-Refund:** Automatically refunds credits (`calculateBatchCreditSettlement`) for any document ending in `MANUAL_REVIEW_REQUIRED` due to upstream API failures, paired with client-side in-flight locks to prevent double-spend spam clicks.
+* **Local Identity Regex Fallback:** Extracts Student Name and NIM/ID (`extractIdentityFallback`) from headers or filenames (`11.22.045.88`, `2021/SI/045`, `UAS_RPL_112204510088_Rizky.pdf`) whenever the LLM returns `"Tidak Tertera"`.
+* **CSV Formula Injection Guard:** Sanitizes cells starting with `=`, `+`, `-`, `@`, `\t`, or `\r` to prevent DDE/Spreadsheet execution attacks when opened in Excel.
+
+---
+
 ## Project Structure
 
 ```text
 rubrika/
 ├── src/
 │   ├── lib/
-│   │   ├── credits/         # Credit wallet guard, calibration quota, & QRIS top-up package
-│   │   ├── exporter/        # UTF-8 BOM CSV / Excel gradebook compiler
+│   │   ├── __tests__/       # Vitest QA & Security Hardening test suites (22 tests)
+│   │   │   ├── evaluator.test.ts
+│   │   │   ├── parser-exporter.test.ts
+│   │   │   ├── post-beta.test.ts
+│   │   │   ├── security-hardening.test.ts
+│   │   │   └── similarity.test.ts
+│   │   ├── credits/         # Credit wallet guard, auto-refund settlement, & QRIS top-up
+│   │   ├── exporter/        # UTF-8 BOM CSV / Excel gradebook compiler with DDE guard
 │   │   ├── grader/          # System prompts, Zod schemas, Gemini evaluator, & batch worker pool
 │   │   │   ├── batch.ts
 │   │   │   ├── evaluator.ts
 │   │   │   ├── index.ts
 │   │   │   ├── prompt.ts
 │   │   │   └── schema.ts
-│   │   ├── parser/          # Local PDF, DOCX, TXT, and recursive ZIP extraction engine
+│   │   ├── parser/          # Local PDF, DOCX, TXT, and ZIP extraction engine (with ZIP bomb guard)
 │   │   └── similarity/      # Unigram/Bigram TF-IDF vectorizer & Cosine Similarity engine
 │   ├── routes/
 │   │   ├── api/session/

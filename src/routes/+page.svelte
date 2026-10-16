@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import type {
     BatchDocumentResult,
     CalibrationSampleItem,
@@ -12,25 +13,17 @@
     MAX_FREE_CALIBRATION_RUNS,
     TOPUP_PACKAGE
   } from '$lib/credits';
+  import {
+    createManualEvaluationForDocument,
+    deleteGradingSession,
+    loadSnapshotFromStorage,
+    purgeSessionRawText,
+    saveSnapshotToStorage,
+    upsertGradingSession,
+    type SavedGradingSession
+  } from '$lib/session-store';
 
-  // --- State: Wallet & API Key ---
-  let creditBalance = INITIAL_FREE_CREDITS;
-  let showTopupModal = false;
-  let topupReason = '';
-  let customApiKey = '';
-  let showApiKeyInput = false;
-
-  // --- State: Wizard Step (1..4) ---
-  let currentStep = 1;
-  let errorMessage = '';
-  let statusNotice = '';
-
-  // --- Step 1: Setup Tugas & Rubrik ---
-  let sessionTitle = 'UAS Rekayasa Perangkat Lunak - Kelas TI-4A';
-  let assignmentContext =
-    'Mata Kuliah: Rekayasa Perangkat Lunak\nTugas: Buat esai analisis perbandingan arsitektur Monolitik vs Microservices beserta studi kasus penerapannya. Wajib sertakan minimal 3 referensi akademik/industri.';
-  let selectedTone: GradingTone = 'Balanced';
-  let rubricCriteria: RubricCriterion[] = [
+  const DEFAULT_CRITERIA: RubricCriterion[] = [
     {
       name: 'Kedalaman Analisis Teknis',
       weightPercentage: 50,
@@ -50,6 +43,212 @@
         'Minimal 3 referensi akademik atau standar industri yang valid.'
     }
   ];
+
+  // --- State: Wallet, API Key & Session Persistence ---
+  let activeSessionId = 'session-default-1';
+  let savedSessions: SavedGradingSession[] = [];
+  let showSessionDrawer = false;
+  let isHydrated = false;
+  let rawTextPurged = false;
+
+  let creditBalance = INITIAL_FREE_CREDITS;
+  let showTopupModal = false;
+  let topupReason = '';
+  let customApiKey = '';
+  let showApiKeyInput = false;
+
+  // --- State: Wizard Step (1..4) ---
+  let currentStep = 1;
+  let errorMessage = '';
+  let statusNotice = '';
+
+  // --- Step 1: Setup Tugas & Rubrik ---
+  let sessionTitle = 'UAS Rekayasa Perangkat Lunak - Kelas TI-4A';
+  let assignmentContext =
+    'Mata Kuliah: Rekayasa Perangkat Lunak\nTugas: Buat esai analisis perbandingan arsitektur Monolitik vs Microservices beserta studi kasus penerapannya. Wajib sertakan minimal 3 referensi akademik/industri.';
+  let selectedTone: GradingTone = 'Balanced';
+  let rubricCriteria: RubricCriterion[] = structuredClone(DEFAULT_CRITERIA);
+
+  // --- Step 2: Bulk Upload & Similarity Matrix ---
+  let isDragging = false;
+  let isParsing = false;
+  let extractedDocuments: ExtractedDocument[] = [];
+  let similarityResults: SimilarityRecord[] = [];
+  let similarityThreshold = 0.8;
+
+  // --- Step 3: Kalibrasi 3 Sampel & Eksekusi ---
+  let calibrationRunsUsed = 0;
+  let calibrationNotes = '';
+  let isCalibrating = false;
+  let isExecutingBatch = false;
+  let calibrationSamples: CalibrationSampleItem[] = [];
+  let remainingDocsAfterSample: ExtractedDocument[] = [];
+  let lastRefundedCredits = 0;
+
+  // --- Step 4: Eksekusi Batch, Review, Extracted Text Viewer & Export ---
+  let batchResults: BatchDocumentResult[] = [];
+  let selectedResultForModal: BatchDocumentResult | null = null;
+  let selectedResultIndex: number = -1;
+  let activeModalTab: 'grading' | 'extracted_text' | 'side_by_side' = 'grading';
+  let manualScoreInput = 75;
+  let manualFeedbackInput =
+    'Dinilai secara manual oleh dosen melalui peninjauan teks dokumen asli.';
+  let manualStudentNameInput = '';
+  let manualStudentIdInput = '';
+  let isExporting = false;
+
+  // --- Lifecycle: Hydrate & Persist Session State (Anti-Refresh F5) ---
+  function buildCurrentSessionObject(): SavedGradingSession {
+    return {
+      id: activeSessionId,
+      title: sessionTitle.trim() || 'Sesi Penilaian Tanpa Judul',
+      updatedAt: new Date().toISOString(),
+      currentStep,
+      assignmentContext,
+      selectedTone,
+      rubricCriteria,
+      calibrationRunsUsed,
+      calibrationNotes,
+      extractedDocuments,
+      similarityResults,
+      calibrationSamples,
+      batchResults,
+      rawTextPurged
+    };
+  }
+
+  function applySessionToState(session: SavedGradingSession) {
+    activeSessionId = session.id;
+    sessionTitle = session.title;
+    currentStep = session.currentStep;
+    assignmentContext = session.assignmentContext;
+    selectedTone = session.selectedTone;
+    rubricCriteria =
+      session.rubricCriteria.length > 0
+        ? session.rubricCriteria
+        : structuredClone(DEFAULT_CRITERIA);
+    calibrationRunsUsed = session.calibrationRunsUsed;
+    calibrationNotes = session.calibrationNotes;
+    extractedDocuments = session.extractedDocuments ?? [];
+    similarityResults = session.similarityResults ?? [];
+    calibrationSamples = session.calibrationSamples ?? [];
+    batchResults = session.batchResults ?? [];
+    rawTextPurged = Boolean(session.rawTextPurged);
+  }
+
+  function persistCurrentState() {
+    if (!isHydrated) return;
+    const currentSession = buildCurrentSessionObject();
+    savedSessions = upsertGradingSession(savedSessions, currentSession);
+    saveSnapshotToStorage({
+      version: 1,
+      activeSessionId,
+      creditBalance,
+      sessions: savedSessions
+    });
+  }
+
+  onMount(() => {
+    const restored = loadSnapshotFromStorage();
+    if (restored && restored.sessions.length > 0) {
+      creditBalance = restored.creditBalance;
+      savedSessions = restored.sessions;
+      const target =
+        restored.sessions.find((s) => s.id === restored.activeSessionId) ??
+        restored.sessions[0];
+      if (target) {
+        applySessionToState(target);
+      }
+    } else {
+      const initial = buildCurrentSessionObject();
+      savedSessions = [initial];
+    }
+    isHydrated = true;
+    persistCurrentState();
+  });
+
+  // Auto-sync state ke localStorage setiap ada perubahan
+  $: if (isHydrated) {
+    void [
+      sessionTitle,
+      currentStep,
+      assignmentContext,
+      selectedTone,
+      rubricCriteria,
+      calibrationRunsUsed,
+      calibrationNotes,
+      extractedDocuments,
+      similarityResults,
+      calibrationSamples,
+      batchResults,
+      rawTextPurged,
+      creditBalance
+    ];
+    persistCurrentState();
+  }
+
+  function createNewGradingSession() {
+    const newId = `session-${Date.now()}`;
+    activeSessionId = newId;
+    sessionTitle = `Sesi Penilaian Baru (${new Date().toLocaleDateString('id-ID')})`;
+    currentStep = 1;
+    assignmentContext =
+      'Mata Kuliah: Rekayasa Perangkat Lunak\nTugas: Buat esai analisis perbandingan arsitektur Monolitik vs Microservices beserta studi kasus penerapannya. Wajib sertakan minimal 3 referensi akademik/industri.';
+    selectedTone = 'Balanced';
+    rubricCriteria = structuredClone(DEFAULT_CRITERIA);
+    calibrationRunsUsed = 0;
+    calibrationNotes = '';
+    extractedDocuments = [];
+    similarityResults = [];
+    calibrationSamples = [];
+    batchResults = [];
+    rawTextPurged = false;
+    lastRefundedCredits = 0;
+    errorMessage = '';
+    statusNotice = 'Sesi penilaian baru telah dibuat.';
+    showSessionDrawer = false;
+    persistCurrentState();
+  }
+
+  function switchGradingSession(sessionId: string) {
+    const target = savedSessions.find((s) => s.id === sessionId);
+    if (!target) return;
+    applySessionToState(target);
+    showSessionDrawer = false;
+    errorMessage = '';
+    statusNotice = `Berpindah ke sesi "${target.title}".`;
+    persistCurrentState();
+  }
+
+  function handleRemoveSession(sessionId: string) {
+    const updated = deleteGradingSession(savedSessions, sessionId);
+    savedSessions = updated;
+
+    if (sessionId === activeSessionId) {
+      if (updated.length > 0) {
+        applySessionToState(updated[0]);
+      } else {
+        createNewGradingSession();
+        return;
+      }
+    }
+    saveSnapshotToStorage({
+      version: 1,
+      activeSessionId,
+      creditBalance,
+      sessions: savedSessions
+    });
+  }
+
+  function handlePurgeRawText() {
+    const current = buildCurrentSessionObject();
+    const purged = purgeSessionRawText(current);
+    extractedDocuments = purged.extractedDocuments;
+    rawTextPurged = true;
+    persistCurrentState();
+    statusNotice =
+      '🧹 Seluruh teks mentah dokumen mahasiswa telah dihapus secara permanen dari sesi ini. Nilai akhir, rincian skor rubrik, dan feedback tetap tersimpan aman.';
+  }
 
   $: totalWeight = rubricCriteria.reduce(
     (sum, item) => sum + (Number(item.weightPercentage) || 0),
@@ -79,13 +278,6 @@
     rubricCriteria = rubricCriteria.filter((_, i) => i !== index);
   }
 
-  // --- Step 2: Bulk Upload & Similarity Matrix ---
-  let isDragging = false;
-  let isParsing = false;
-  let extractedDocuments: ExtractedDocument[] = [];
-  let similarityResults: SimilarityRecord[] = [];
-  let similarityThreshold = 0.8;
-
   function getSimilarityForDoc(doc: ExtractedDocument): SimilarityRecord {
     return (
       similarityResults.find(
@@ -97,6 +289,19 @@
         closest_match_file: null
       }
     );
+  }
+
+  function getExtractedTextByFilename(
+    filename: string | null | undefined,
+    docId?: string
+  ): string {
+    if (!filename && !docId) return '';
+    const match = extractedDocuments.find(
+      (d) =>
+        (docId && d.id === docId) ||
+        (filename && d.originalFilename === filename)
+    );
+    return match?.extractedDocumentText ?? '';
   }
 
   $: bypassedDocCount = extractedDocuments.filter(
@@ -139,6 +344,7 @@
 
       extractedDocuments = data.documents;
       similarityResults = data.similarityResults;
+      rawTextPurged = false;
       statusNotice = `Berhasil mengekstrak ${data.summary.totalDocuments} dokumen (${data.summary.flaggedSimilarityCount} terdeteksi mirip >= ${Math.round(similarityThreshold * 100)}%).`;
     } catch (err) {
       errorMessage =
@@ -241,6 +447,7 @@ Referensi:
 
       extractedDocuments = data.documents;
       similarityResults = data.similarityResults;
+      rawTextPurged = false;
       statusNotice = `Berhasil memuat ${data.summary.totalDocuments} dokumen sampel (${data.summary.flaggedSimilarityCount} terdeteksi indikasi plagiasi lintas mahasiswa).`;
     } catch (err) {
       errorMessage =
@@ -250,17 +457,7 @@ Referensi:
     }
   }
 
-  // --- Step 3: Kalibrasi 3 Sampel & Eksekusi ---
-  let calibrationRunsUsed = 0;
-  let calibrationNotes = '';
-  let isCalibrating = false;
-  let isExecutingBatch = false;
-  let calibrationSamples: CalibrationSampleItem[] = [];
-  let remainingDocsAfterSample: ExtractedDocument[] = [];
-  let lastRefundedCredits = 0;
-
   async function triggerCalibrationSample() {
-    // In-flight lock mencegah klik ganda / race condition
     if (isCalibrating || isExecutingBatch) return;
     if (calibrationRunsUsed >= MAX_FREE_CALIBRATION_RUNS) return;
 
@@ -303,14 +500,7 @@ Referensi:
     }
   }
 
-  // --- Step 4: Eksekusi Batch, Review & Export ---
-  let batchResults: BatchDocumentResult[] = [];
-  let selectedResultForModal: BatchDocumentResult | null = null;
-  let selectedResultIndex: number = -1;
-  let isExporting = false;
-
   async function executeRemainingOrFullBatch() {
-    // In-flight lock mencegah spam klik / pemotongan kuota ganda
     if (isExecutingBatch || isCalibrating) return;
 
     errorMessage = '';
@@ -426,9 +616,41 @@ Referensi:
     selectedResultForModal = updatedItem;
   }
 
-  function openDetailModal(item: BatchDocumentResult, index: number) {
+  function saveManualGradingForCurrentModal() {
+    if (!selectedResultForModal || selectedResultIndex < 0) return;
+
+    const updated = createManualEvaluationForDocument(
+      selectedResultForModal,
+      rubricCriteria,
+      manualScoreInput,
+      manualFeedbackInput,
+      manualStudentNameInput.trim() || 'Tidak Tertera',
+      manualStudentIdInput.trim() || 'Tidak Tertera'
+    );
+
+    batchResults[selectedResultIndex] = updated;
+    batchResults = [...batchResults];
+    selectedResultForModal = updated;
+    activeModalTab = 'grading';
+    statusNotice = `Nilai manual (${updated.evaluation?.final_weighted_score}) berhasil disimpan untuk ${updated.filename}.`;
+  }
+
+  function openDetailModal(
+    item: BatchDocumentResult,
+    index: number,
+    initialTab: 'grading' | 'extracted_text' | 'side_by_side' = 'grading'
+  ) {
     selectedResultForModal = item;
     selectedResultIndex = index;
+    activeModalTab = initialTab;
+    manualScoreInput = item.evaluation?.final_weighted_score ?? 75;
+    manualFeedbackInput =
+      item.evaluation?.feedback_for_student ??
+      'Dinilai secara manual oleh dosen melalui peninjauan teks dokumen asli.';
+    manualStudentNameInput =
+      item.evaluation?.student_identity.extracted_name ?? '';
+    manualStudentIdInput =
+      item.evaluation?.student_identity.extracted_id ?? '';
   }
 
   function closeDetailModal() {
@@ -437,7 +659,7 @@ Referensi:
   }
 
   async function downloadGradebookCSV() {
-    if (batchResults.length === 0) return;
+    if (isExporting || batchResults.length === 0) return;
     isExporting = true;
     errorMessage = '';
 
@@ -485,7 +707,7 @@ Referensi:
 <div class="min-h-screen flex flex-col bg-slate-50 text-slate-900">
   <!-- Top Navigation & Credit Wallet Header -->
   <header class="sticky top-0 z-30 bg-white border-b border-slate-200 shadow-sm">
-    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-3">
       <div class="flex items-center gap-3">
         <div class="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white font-bold text-lg shadow-sm">
           R
@@ -494,22 +716,31 @@ Referensi:
           <div class="flex items-center gap-2">
             <h1 class="text-lg font-bold tracking-tight text-slate-900">Rubrika</h1>
             <span class="text-xs font-medium px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
-              Deterministic AI Grader
+              v1.0
             </span>
           </div>
-          <p class="text-xs text-slate-500 hidden sm:block">
+          <p class="text-xs text-slate-500 hidden md:block">
             High-Throughput Academic Assessment & Plagiarism Control
           </p>
         </div>
       </div>
 
-      <div class="flex items-center gap-3">
+      <div class="flex items-center gap-2 sm:gap-3">
+        <!-- Fitur #3: Tombol Riwayat Sesi Penilaian -->
+        <button
+          type="button"
+          on:click={() => (showSessionDrawer = true)}
+          class="text-xs font-semibold px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-100 text-slate-700 transition flex items-center gap-1.5"
+        >
+          <span>🗂️ Riwayat Sesi ({savedSessions.length})</span>
+        </button>
+
         <button
           type="button"
           on:click={() => (showApiKeyInput = !showApiKeyInput)}
-          class="text-xs font-medium px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-100 text-slate-700 transition"
+          class="text-xs font-medium px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-100 text-slate-700 transition hidden sm:inline-flex"
         >
-          {customApiKey ? '🔑 API Key Aktif' : '⚙️ Konfigurasi API Key'}
+          {customApiKey ? '🔑 API Key Aktif' : '⚙️ API Key'}
         </button>
 
         <!-- Indikator Saldo Dompet Kredit -->
@@ -528,11 +759,23 @@ Referensi:
               topupReason = '';
               showTopupModal = true;
             }}
-            class="ml-2 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-sm transition"
+            class="ml-1 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-sm transition"
           >
             + Top-Up QRIS
           </button>
         </div>
+      </div>
+    </div>
+
+    <!-- Fitur #6: Banner Jaminan Privasi Akademik -->
+    <div class="bg-slate-900/95 text-slate-200 px-4 py-1.5 text-[11px] border-b border-slate-800">
+      <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2">
+        <span>
+          🔒 <strong>Privasi Akademik Terjamin:</strong> Teks dokumen diproses secara terisolasi, tidak digunakan untuk melatih AI publik, dan dapat dihapus kapan saja.
+        </span>
+        <span class="text-emerald-400 font-medium">
+          ✓ Auto-Save Sesi Aktif (Tahan Refresh F5)
+        </span>
       </div>
     </div>
 
@@ -571,7 +814,7 @@ Referensi:
           { step: 1, title: '1. Setup Tugas & Rubrik', desc: 'Konteks soal, bobot & tone' },
           { step: 2, title: '2. Bulk Upload', desc: 'PDF/DOCX/ZIP & Cek Plagiasi Lokal' },
           { step: 3, title: '3. Kalibrasi 3 Sampel', desc: 'Dry-run & Revisi Instruksi Dosen' },
-          { step: 4, title: '4. Review & Export', desc: 'Edit Nilai & Unduh CSV/Excel' }
+          { step: 4, title: '4. Review & Export', desc: 'Edit Nilai, Baca Teks & Unduh CSV' }
         ] as item}
           <li>
             <button
@@ -638,11 +881,20 @@ Referensi:
     <!-- STEP 1: SETUP TUGAS & RUBRIK -->
     {#if currentStep === 1}
       <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-8">
-        <div>
-          <h2 class="text-xl font-bold text-slate-900">Langkah 1: Konfigurasi Tugas & Rubrik Terbobot</h2>
-          <p class="text-sm text-slate-500 mt-1">
-            Tentukan konteks soal, kriteria penilaian dengan total bobot 100%, serta gaya penilaian dosen.
-          </p>
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h2 class="text-xl font-bold text-slate-900">Langkah 1: Konfigurasi Tugas & Rubrik Terbobot</h2>
+            <p class="text-sm text-slate-500 mt-1">
+              Tentukan konteks soal, kriteria penilaian dengan total bobot 100%, serta gaya penilaian dosen.
+            </p>
+          </div>
+          <button
+            type="button"
+            on:click={createNewGradingSession}
+            class="px-3.5 py-2 rounded-xl border border-slate-200 hover:bg-slate-50 text-xs font-semibold text-slate-700"
+          >
+            + Buat Sesi Baru
+          </button>
         </div>
 
         <div class="grid grid-cols-1 gap-6">
@@ -876,7 +1128,7 @@ Referensi:
               : 'Klik untuk memilih file atau tarik (Drag & Drop) ke area ini'}
           </p>
           <p class="text-xs text-slate-500 mt-1">
-            Mendukung multi-file .PDF, .DOCX, .TXT, atau arsip kelas .ZIP (otomatis mengabaikan __MACOSX)
+            Mendukung multi-file .PDF, .DOCX, .TXT, atau arsip kelas .ZIP (maks 100 file, 5 MB/file)
           </p>
         </label>
 
@@ -1120,26 +1372,44 @@ Referensi:
       </div>
     {/if}
 
-    <!-- STEP 4: REVIEW & EXPORT -->
+    <!-- STEP 4: REVIEW, SIDE-BY-SIDE VIEWER, DATA PURGE & EXPORT -->
     {#if currentStep === 4}
       <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
-        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div>
             <div class="flex items-center gap-2.5 flex-wrap">
               <h2 class="text-xl font-bold text-slate-900">
-                Langkah 4: Review Nilai, Edit Inline & Export Gradebook
+                Langkah 4: Review Nilai, Baca Teks Asli & Export Gradebook
               </h2>
               {#if lastRefundedCredits > 0}
                 <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
                   💸 Auto-Refund +{lastRefundedCredits} Kredit (Dokumen Gagal API)
                 </span>
               {/if}
+              {#if rawTextPurged}
+                <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                  🔒 Teks Mentah Telah Dibersihkan
+                </span>
+              {/if}
             </div>
             <p class="text-sm text-slate-500 mt-1">
-              Klik nilai akhir untuk mengedit langsung, atau klik <strong>Detail & Feedback</strong> untuk meninjau alasan per kriteria.
+              Klik nilai akhir untuk edit langsung, buka <strong>Teks Asli / Bandingkan Kemiripan</strong>, atau unduh rekap nilai.
             </p>
           </div>
-          <div class="flex items-center gap-3">
+          <div class="flex flex-wrap items-center gap-2.5">
+            <!-- Fitur #6: Tombol Bersihkan Teks Mentah Dokumen (Data Purge) -->
+            <button
+              type="button"
+              disabled={rawTextPurged}
+              on:click={handlePurgeRawText}
+              class="px-3.5 py-2 rounded-xl border border-slate-300 text-slate-700 text-xs font-semibold hover:bg-slate-50 disabled:opacity-40 transition"
+              title="Hapus seluruh teks mentah dokumen dari penyimpanan lokal dan hanya simpan nilai & feedback"
+            >
+              {rawTextPurged
+                ? '✓ Teks Mentah Dihapus'
+                : '🧹 Bersihkan Teks Mentah Dokumen (Hanya Simpan Nilai & Feedback)'}
+            </button>
+
             <button
               type="button"
               on:click={() => (currentStep = 3)}
@@ -1197,9 +1467,14 @@ Referensi:
                   </td>
                   <td class="px-4 py-3">
                     {#if item.integrity_check.similarity_flagged}
-                      <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-bold bg-red-100 text-red-800 border border-red-300">
-                        🚨 Mirip {Math.round(item.integrity_check.max_similarity_score * 100)}%
-                      </span>
+                      <button
+                        type="button"
+                        on:click={() => openDetailModal(item, idx, 'side_by_side')}
+                        class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-bold bg-red-100 text-red-800 border border-red-300 hover:bg-red-200 transition"
+                        title="Klik untuk membandingkan teks berdampingan"
+                      >
+                        🚨 Mirip {Math.round(item.integrity_check.max_similarity_score * 100)}% • Bandingkan
+                      </button>
                       {#if item.integrity_check.closest_match_file}
                         <span class="block text-[11px] text-red-700 mt-0.5">
                           vs {item.integrity_check.closest_match_file}
@@ -1240,14 +1515,27 @@ Referensi:
                         class="w-24 rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-indigo-700 focus:border-indigo-600 focus:outline-none"
                       />
                     {:else}
-                      <span class="text-xs text-amber-700 font-medium">Perlu Cek Manual</span>
+                      <button
+                        type="button"
+                        on:click={() => openDetailModal(item, idx, 'extracted_text')}
+                        class="text-xs text-amber-700 hover:underline font-semibold"
+                      >
+                        ✍️ Beri Nilai Manual
+                      </button>
                     {/if}
                   </td>
-                  <td class="px-4 py-3 text-right">
+                  <td class="px-4 py-3 text-right space-x-1.5">
                     <button
                       type="button"
-                      on:click={() => openDetailModal(item, idx)}
-                      class="px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-100 text-xs font-semibold text-slate-700"
+                      on:click={() => openDetailModal(item, idx, 'extracted_text')}
+                      class="px-2.5 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-100 text-xs font-medium text-slate-700"
+                    >
+                      📄 Teks Asli
+                    </button>
+                    <button
+                      type="button"
+                      on:click={() => openDetailModal(item, idx, 'grading')}
+                      class="px-3 py-1.5 rounded-lg border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-xs font-semibold text-indigo-700"
                     >
                       Detail & Feedback
                     </button>
@@ -1262,10 +1550,18 @@ Referensi:
   </main>
 </div>
 
-<!-- MODAL DETAIL REASONING & FEEDBACK MAHASISWA -->
+<!-- FITUR #2: MODAL DETAIL REASONING, LIHAT TEKS ASLI & SIDE-BY-SIDE SIMILARITY VIEWER -->
 {#if selectedResultForModal}
+  {@const currentDocText = getExtractedTextByFilename(
+    selectedResultForModal.filename,
+    selectedResultForModal.document_id
+  )}
+  {@const closestMatchFilename =
+    selectedResultForModal.integrity_check.closest_match_file}
+  {@const comparisonDocText = getExtractedTextByFilename(closestMatchFilename)}
+
   <div class="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
-    <div class="bg-white rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto shadow-xl border border-slate-200 p-6 space-y-5">
+    <div class="bg-white rounded-2xl max-w-4xl w-full max-h-[90vh] overflow-y-auto shadow-xl border border-slate-200 p-6 space-y-5">
       <div class="flex items-start justify-between gap-4 border-b border-slate-200 pb-4">
         <div>
           <h3 class="text-lg font-bold text-slate-900">
@@ -1285,63 +1581,263 @@ Referensi:
         </button>
       </div>
 
-      {#if selectedResultForModal.evaluation}
-        <div class="space-y-3">
-          <div class="flex items-center justify-between">
-            <h4 class="text-xs font-bold uppercase tracking-wider text-slate-600">
-              Rincian Skor Per Kriteria (Dapat Diedit)
-            </h4>
-            <span class="text-sm font-extrabold text-indigo-700">
-              Nilai Akhir Terbobot: {selectedResultForModal.evaluation.final_weighted_score}
-            </span>
+      <!-- Tab Navigation di dalam Modal -->
+      <div class="flex flex-wrap gap-2 border-b border-slate-200 pb-3">
+        <button
+          type="button"
+          on:click={() => (activeModalTab = 'grading')}
+          class="px-3.5 py-2 rounded-xl text-xs font-bold transition {activeModalTab ===
+          'grading'
+            ? 'bg-indigo-600 text-white'
+            : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}"
+        >
+          📊 Rincian Nilai & Feedback
+        </button>
+        <button
+          type="button"
+          on:click={() => (activeModalTab = 'extracted_text')}
+          class="px-3.5 py-2 rounded-xl text-xs font-bold transition {activeModalTab ===
+          'extracted_text'
+            ? 'bg-indigo-600 text-white'
+            : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}"
+        >
+          📄 Lihat Teks Dokumen Asli (Extracted Text)
+        </button>
+        {#if closestMatchFilename}
+          <button
+            type="button"
+            on:click={() => (activeModalTab = 'side_by_side')}
+            class="px-3.5 py-2 rounded-xl text-xs font-bold transition {activeModalTab ===
+            'side_by_side'
+              ? 'bg-red-600 text-white'
+              : 'bg-red-50 text-red-700 border border-red-200 hover:bg-red-100'}"
+          >
+            🔍 Bandingkan Teks Berdampingan ({Math.round(
+              selectedResultForModal.integrity_check.max_similarity_score * 100
+            )}% Mirip)
+          </button>
+        {/if}
+      </div>
+
+      <!-- TAB 1: RINCIAN NILAI & FEEDBACK -->
+      {#if activeModalTab === 'grading'}
+        {#if selectedResultForModal.evaluation}
+          <div class="space-y-3">
+            <div class="flex items-center justify-between">
+              <h4 class="text-xs font-bold uppercase tracking-wider text-slate-600">
+                Rincian Skor Per Kriteria (Dapat Diedit)
+              </h4>
+              <span class="text-sm font-extrabold text-indigo-700">
+                Nilai Akhir Terbobot: {selectedResultForModal.evaluation.final_weighted_score}
+              </span>
+            </div>
+
+            {#each selectedResultForModal.evaluation.grading_breakdown as crit, cIdx}
+              <div class="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="text-sm font-bold text-slate-800">
+                    {crit.criterion_name} ({crit.weight_percentage}%)
+                  </span>
+                  <div class="flex items-center gap-1.5">
+                    <span class="text-xs text-slate-500">Skor:</span>
+                    <input
+                      type="number"
+                      min="0"
+                      max="100"
+                      value={crit.score_given}
+                      on:change={(e) =>
+                        handleCriterionScoreEdit(
+                          selectedResultIndex,
+                          cIdx,
+                          e.currentTarget.value
+                        )}
+                      class="w-20 rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs font-bold text-indigo-700"
+                    />
+                  </div>
+                </div>
+                <p class="text-xs text-slate-600 leading-relaxed">
+                  {crit.short_reasoning}
+                </p>
+              </div>
+            {/each}
           </div>
 
-          {#each selectedResultForModal.evaluation.grading_breakdown as crit, cIdx}
-            <div class="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
-              <div class="flex items-center justify-between gap-2">
-                <span class="text-sm font-bold text-slate-800">
-                  {crit.criterion_name} ({crit.weight_percentage}%)
+          <div class="space-y-1.5">
+            <label for="modal-feedback" class="block text-xs font-bold uppercase tracking-wider text-slate-600">
+              Feedback Konstruktif Untuk Mahasiswa
+            </label>
+            <textarea
+              id="modal-feedback"
+              rows="3"
+              bind:value={selectedResultForModal.evaluation.feedback_for_student}
+              on:input={() => (batchResults = [...batchResults])}
+              class="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-sm text-slate-800 focus:border-indigo-600 focus:outline-none"
+            ></textarea>
+          </div>
+        {:else}
+          <div class="p-4 rounded-xl bg-amber-50 border border-amber-200 space-y-4">
+            <div class="text-sm text-amber-900">
+              Dokumen ini berstatus <strong>MANUAL_REVIEW_REQUIRED</strong>:
+              <p class="mt-1 text-xs">{selectedResultForModal.error_message}</p>
+            </div>
+
+            <div class="border-t border-amber-200 pt-4 space-y-3">
+              <h4 class="text-xs font-bold uppercase tracking-wider text-amber-950">
+                ✍️ Input Penilaian Manual Dosen
+              </h4>
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label for="manual-name" class="block text-xs font-medium text-slate-700 mb-1">
+                    Nama Mahasiswa
+                  </label>
+                  <input
+                    id="manual-name"
+                    type="text"
+                    bind:value={manualStudentNameInput}
+                    placeholder="Nama Mahasiswa"
+                    class="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs"
+                  />
+                </div>
+                <div>
+                  <label for="manual-id" class="block text-xs font-medium text-slate-700 mb-1">
+                    NIM / ID
+                  </label>
+                  <input
+                    id="manual-id"
+                    type="text"
+                    bind:value={manualStudentIdInput}
+                    placeholder="NIM Mahasiswa"
+                    class="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs"
+                  />
+                </div>
+                <div>
+                  <label for="manual-score" class="block text-xs font-medium text-slate-700 mb-1">
+                    Nilai Akhir (0-100)
+                  </label>
+                  <input
+                    id="manual-score"
+                    type="number"
+                    min="0"
+                    max="100"
+                    bind:value={manualScoreInput}
+                    class="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-bold text-indigo-700"
+                  />
+                </div>
+              </div>
+              <div>
+                <label for="manual-feedback-input" class="block text-xs font-medium text-slate-700 mb-1">
+                  Feedback Mahasiswa
+                </label>
+                <textarea
+                  id="manual-feedback-input"
+                  rows="2"
+                  bind:value={manualFeedbackInput}
+                  class="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs"
+                ></textarea>
+              </div>
+              <button
+                type="button"
+                on:click={saveManualGradingForCurrentModal}
+                class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold"
+              >
+                ✓ Simpan Nilai Manual
+              </button>
+            </div>
+          </div>
+        {/if}
+      {/if}
+
+      <!-- TAB 2: LIHAT TEKS DOKUMEN ASLI (EXTRACTED TEXT) -->
+      {#if activeModalTab === 'extracted_text'}
+        <div class="space-y-4">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold uppercase tracking-wider text-slate-600">
+              📄 Isi Teks Dokumen ({selectedResultForModal.filename})
+            </span>
+            {#if rawTextPurged}
+              <span class="text-xs font-semibold text-emerald-700">
+                🔒 Teks mentah telah dihapus demi privasi
+              </span>
+            {/if}
+          </div>
+
+          <div class="p-4 rounded-xl bg-slate-900 text-slate-100 font-mono text-xs whitespace-pre-wrap max-h-80 overflow-y-auto leading-relaxed">
+            {#if rawTextPurged}
+              [Teks mentah dokumen telah dibersihkan oleh dosen melalui fitur Data Purge Privasi Akademik.]
+            {:else if currentDocText}
+              {currentDocText}
+            {:else}
+              [Tidak ada teks yang dapat ditampilkan dari dokumen ini.]
+            {/if}
+          </div>
+
+          {#if selectedResultForModal.status === 'MANUAL_REVIEW_REQUIRED'}
+            <div class="p-4 rounded-xl bg-indigo-50 border border-indigo-200 flex flex-col sm:flex-row sm:items-end justify-between gap-3">
+              <div class="flex-1 space-y-2">
+                <span class="block text-xs font-bold text-indigo-950">
+                  ✍️ Beri Nilai Langsung Setelah Membaca Teks:
                 </span>
-                <div class="flex items-center gap-1.5">
-                  <span class="text-xs text-slate-500">Skor:</span>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <input
                     type="number"
                     min="0"
                     max="100"
-                    value={crit.score_given}
-                    on:change={(e) =>
-                      handleCriterionScoreEdit(
-                        selectedResultIndex,
-                        cIdx,
-                        e.currentTarget.value
-                      )}
-                    class="w-20 rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs font-bold text-indigo-700"
+                    bind:value={manualScoreInput}
+                    placeholder="Nilai (0-100)"
+                    class="rounded-lg border border-indigo-300 bg-white px-3 py-1.5 text-xs font-bold"
+                  />
+                  <input
+                    type="text"
+                    bind:value={manualFeedbackInput}
+                    placeholder="Catatan feedback..."
+                    class="rounded-lg border border-indigo-300 bg-white px-3 py-1.5 text-xs"
                   />
                 </div>
               </div>
-              <p class="text-xs text-slate-600 leading-relaxed">
-                {crit.short_reasoning}
-              </p>
+              <button
+                type="button"
+                on:click={saveManualGradingForCurrentModal}
+                class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shrink-0"
+              >
+                ✓ Simpan Nilai Manual
+              </button>
             </div>
-          {/each}
+          {/if}
         </div>
+      {/if}
 
-        <div class="space-y-1.5">
-          <label for="modal-feedback" class="block text-xs font-bold uppercase tracking-wider text-slate-600">
-            Feedback Konstruktif Untuk Mahasiswa
-          </label>
-          <textarea
-            id="modal-feedback"
-            rows="3"
-            bind:value={selectedResultForModal.evaluation.feedback_for_student}
-            on:input={() => (batchResults = [...batchResults])}
-            class="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-sm text-slate-800 focus:border-indigo-600 focus:outline-none"
-          ></textarea>
-        </div>
-      {:else}
-        <div class="p-4 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-900">
-          Dokumen ini berstatus <strong>MANUAL_REVIEW_REQUIRED</strong>:
-          <p class="mt-1 text-xs">{selectedResultForModal.error_message}</p>
+      <!-- TAB 3: SIDE-BY-SIDE SIMILARITY VIEWER -->
+      {#if activeModalTab === 'side_by_side'}
+        <div class="space-y-3">
+          <div class="p-3 rounded-xl bg-red-50 border border-red-200 flex items-center justify-between">
+            <div class="text-xs text-red-900">
+              <strong>🔍 Perbandingan Kemiripan Lintas Dokumen:</strong> Tingkat kemiripan TF-IDF unigram+bigram sebesar <strong>{Math.round(selectedResultForModal.integrity_check.max_similarity_score * 100)}%</strong>.
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div class="space-y-1.5">
+              <div class="text-xs font-bold text-slate-800 bg-slate-100 px-3 py-2 rounded-lg border border-slate-200">
+                📄 Dokumen Mahasiswa Ini: {selectedResultForModal.filename}
+              </div>
+              <div class="p-3.5 rounded-xl bg-slate-900 text-slate-100 font-mono text-xs whitespace-pre-wrap h-72 overflow-y-auto leading-relaxed">
+                {rawTextPurged
+                  ? '[Teks mentah telah dihapus (Data Purge).]'
+                  : currentDocText || '[Kosong]'}
+              </div>
+            </div>
+
+            <div class="space-y-1.5">
+              <div class="text-xs font-bold text-red-900 bg-red-50 px-3 py-2 rounded-lg border border-red-200">
+                📄 Dokumen Pembanding Terdekat: {closestMatchFilename ?? '-'}
+              </div>
+              <div class="p-3.5 rounded-xl bg-slate-900 text-slate-100 font-mono text-xs whitespace-pre-wrap h-72 overflow-y-auto leading-relaxed">
+                {rawTextPurged
+                  ? '[Teks mentah telah dihapus (Data Purge).]'
+                  : comparisonDocText || '[Tidak ditemukan]'}
+              </div>
+            </div>
+          </div>
         </div>
       {/if}
 
@@ -1353,6 +1849,83 @@ Referensi:
         >
           Selesai
         </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- FITUR #3: MODAL / DRAWER RIWAYAT SESI PENILAIAN (ANTI-REFRESH F5) -->
+{#if showSessionDrawer}
+  <div class="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-end">
+    <div class="bg-white h-full max-w-md w-full shadow-2xl border-l border-slate-200 p-6 flex flex-col justify-between">
+      <div class="space-y-4 overflow-y-auto pr-1">
+        <div class="flex items-center justify-between border-b border-slate-200 pb-4">
+          <div>
+            <h3 class="text-lg font-bold text-slate-900">🗂️ Riwayat Sesi Penilaian</h3>
+            <p class="text-xs text-slate-500">
+              Otomatis tersimpan di perangkat Anda (Tahan Refresh F5 / Putus Koneksi).
+            </p>
+          </div>
+          <button
+            type="button"
+            on:click={() => (showSessionDrawer = false)}
+            class="text-sm font-semibold text-slate-500 hover:text-slate-800"
+          >
+            ✕
+          </button>
+        </div>
+
+        <button
+          type="button"
+          on:click={createNewGradingSession}
+          class="w-full py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-sm transition"
+        >
+          + Buat Sesi Penilaian Baru
+        </button>
+
+        <div class="space-y-2.5">
+          {#each savedSessions as sess}
+            <div
+              class="p-3.5 rounded-xl border transition {sess.id === activeSessionId
+                ? 'border-indigo-600 bg-indigo-50/50'
+                : 'border-slate-200 bg-white hover:border-slate-300'}"
+            >
+              <div class="flex items-start justify-between gap-2">
+                <button
+                  type="button"
+                  on:click={() => switchGradingSession(sess.id)}
+                  class="text-left flex-1"
+                >
+                  <div class="text-sm font-bold text-slate-900">
+                    {sess.title}
+                  </div>
+                  <div class="text-[11px] text-slate-500 mt-0.5">
+                    Langkah {sess.currentStep}/4 • {sess.extractedDocuments.length} Dokumen • {sess.batchResults.length} Dinilai
+                  </div>
+                  {#if sess.rawTextPurged}
+                    <span class="inline-block mt-1 text-[10px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
+                      🔒 Teks Mentah Dibersihkan
+                    </span>
+                  {/if}
+                </button>
+                {#if savedSessions.length > 1}
+                  <button
+                    type="button"
+                    on:click={() => handleRemoveSession(sess.id)}
+                    class="text-xs text-red-600 hover:underline px-1.5 py-0.5"
+                    title="Hapus sesi ini"
+                  >
+                    Hapus
+                  </button>
+                {/if}
+              </div>
+            </div>
+          {/each}
+        </div>
+      </div>
+
+      <div class="pt-4 border-t border-slate-200 text-[11px] text-slate-500">
+        🔒 Seluruh riwayat sesi disimpan secara lokal di browser Anda untuk mencegah kehilangan progres kerja maupun kredit.
       </div>
     </div>
   </div>

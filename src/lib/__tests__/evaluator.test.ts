@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  DEFAULT_BATCH_CONCURRENCY,
   evaluateDocument,
+  GEMINI_ROTATION_MODELS,
   GradingOutputSchema,
+  parseGoogleRetryDelayMs,
   verifyAndRecalculateScore,
   type BuildGradingPromptParams,
   type GradingOutput
@@ -242,36 +245,48 @@ describe('Evaluator & Schema Unit Tests', () => {
       ai_writing_suspicion: 'Low'
     };
 
-    it('melakukan retry otomatis saat terkena HTTP 429 (Rate Limit) dan berhasil pada percobaan berikutnya', async () => {
-      const fetchMock = vi
-        .fn()
-        .mockResolvedValueOnce(
-          new Response('Too Many Requests', { status: 429 })
-        )
-        .mockResolvedValueOnce(
-          new Response(
+    it('melakukan Multi-Model Quota Rotation otomatis saat terkena HTTP 429 (Rate Limit) ke model berikutnya di daftar rotasi', async () => {
+      const calledUrls: string[] = [];
+      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+        calledUrls.push(url);
+        if (calledUrls.length <= 2) {
+          return new Response(
             JSON.stringify({
-              candidates: [
-                {
-                  content: {
-                    parts: [{ text: JSON.stringify(validMockLlmJson) }]
-                  }
-                }
-              ]
+              error: {
+                code: 429,
+                status: 'RESOURCE_EXHAUSTED',
+                details: [{ retryDelay: '28s' }]
+              }
             }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-          )
+            { status: 429 }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [{ text: JSON.stringify(validMockLlmJson) }]
+                }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
         );
+      });
 
       vi.stubGlobal('fetch', fetchMock);
 
       const result = await evaluateDocument(samplePromptParams, {
         apiKey: 'test-api-key',
         baseDelayMs: 1,
-        maxRetries: 2
+        maxRetries: 3
       });
 
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(calledUrls[0]).toContain('gemini-2.5-flash:');
+      expect(calledUrls[1]).toContain('gemini-2.5-flash-lite:');
+      expect(calledUrls[2]).toContain('gemini-2.0-flash:');
       expect(result.final_weighted_score).toBe(81);
       expect(result.student_identity.extracted_name).toBe('Rizky Pratama');
     });
@@ -309,8 +324,36 @@ describe('Evaluator & Schema Unit Tests', () => {
 
       expect(fetchMock).toHaveBeenCalledTimes(2);
       expect(calledUrls[0]).toContain('gemini-deprecated-model');
-      expect(calledUrls[1]).toContain('gemini-2.0-flash');
+      expect(calledUrls[1]).toContain(GEMINI_ROTATION_MODELS[0]);
       expect(result.final_weighted_score).toBe(81);
+    });
+
+    it('membaca retryDelay dari JSON error Google (misal "28s" dibatasi maks 15 detik) dan menggunakan DEFAULT_BATCH_CONCURRENCY = 3', () => {
+      expect(GEMINI_ROTATION_MODELS).toEqual([
+        'gemini-2.5-flash',
+        'gemini-2.5-flash-lite',
+        'gemini-2.0-flash',
+        'gemini-2.0-flash-lite'
+      ]);
+      expect(DEFAULT_BATCH_CONCURRENCY).toBe(3);
+
+      const google429Json = JSON.stringify({
+        error: {
+          code: 429,
+          message: 'Quota exceeded. Please retry in 28.4s.',
+          status: 'RESOURCE_EXHAUSTED',
+          details: [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '28s' }]
+        }
+      });
+
+      // 28s = 28000ms -> harus dibatasi maksimal 15000ms (15 detik)
+      expect(parseGoogleRetryDelayMs(google429Json)).toBe(15000);
+
+      // 8s = 8000ms -> di bawah 15 detik, dikembalikan sesuai nilai asli
+      const short429Json = JSON.stringify({
+        error: { details: [{ retryDelay: '8s' }] }
+      });
+      expect(parseGoogleRetryDelayMs(short429Json)).toBe(8000);
     });
   });
 });

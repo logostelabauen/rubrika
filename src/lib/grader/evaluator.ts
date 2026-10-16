@@ -15,6 +15,7 @@ export interface EvaluateDocumentOptions {
   model?: string;
   maxRetries?: number;
   baseDelayMs?: number;
+  maxRetryDelayMs?: number;
   temperature?: number;
 }
 
@@ -27,15 +28,17 @@ export const MIN_DOCUMENT_WORD_COUNT = 20;
 export const EMPTY_DOCUMENT_REASONING =
   'Dokumen kosong atau tidak terbaca (< 20 kata, indikasi scan gambar/corrupt). Tidak memotong token API.';
 
-const DEFAULT_GEMINI_MODEL = 'gemini-2.0-flash';
-const FALLBACK_GEMINI_MODELS = [
-  'gemini-2.0-flash',
+export const GEMINI_ROTATION_MODELS = [
   'gemini-2.5-flash',
-  'gemini-1.5-flash-latest',
-  'gemini-1.5-flash'
-];
-const DEFAULT_MAX_RETRIES = 2;
+  'gemini-2.5-flash-lite',
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-lite'
+] as const;
+
+const DEFAULT_GEMINI_MODEL = GEMINI_ROTATION_MODELS[0];
+const DEFAULT_MAX_RETRIES = 4;
 const DEFAULT_BASE_DELAY_MS = 1000;
+export const MAX_SMART_RETRY_DELAY_MS = 15000;
 const DEFAULT_TEMPERATURE = 0.1;
 
 const FILENAME_STOP_TOKENS = new Set([
@@ -96,6 +99,39 @@ function toTitleCase(input: string): string {
 }
 
 /**
+ * Membaca informasi "retryDelay" dari response error JSON Google Gemini (misal "28s" atau "12.5s")
+ * saat seluruh model rotasi terkena HTTP 429, dengan batas tunggu maksimal `maxCapMs` (default 15 detik).
+ */
+export function parseGoogleRetryDelayMs(
+  errorBody: string,
+  maxCapMs: number = MAX_SMART_RETRY_DELAY_MS
+): number | null {
+  if (!errorBody || typeof errorBody !== 'string') {
+    return null;
+  }
+
+  const retryDelayFieldMatch = errorBody.match(
+    /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i
+  );
+  const retryInMessageMatch = errorBody.match(
+    /retry\s+in\s+(\d+(?:\.\d+)?)s/i
+  );
+
+  const secondsStr = retryDelayFieldMatch?.[1] ?? retryInMessageMatch?.[1];
+  if (!secondsStr) {
+    return null;
+  }
+
+  const parsedSeconds = parseFloat(secondsStr);
+  if (Number.isNaN(parsedSeconds) || parsedSeconds <= 0) {
+    return null;
+  }
+
+  const delayMs = Math.ceil(parsedSeconds * 1000);
+  return Math.min(maxCapMs, delayMs);
+}
+
+/**
  * Fallback ekstraksi identitas lokal (Regex) jika LLM mengembalikan "Tidak Tertera".
  * Mencari Nama Mahasiswa dan NIM/NPM dari bagian awal teks dokumen (header/cover)
  * maupun dari pola penamaan file (contoh: `UAS_RPL_112204510088_Rizky_Pratama.pdf`).
@@ -142,11 +178,12 @@ export function extractIdentityFallback(
 
   // 4. Ekstraksi dari nama file jika Nama atau NIM masih belum ditemukan
   if ((!extractedId || !extractedName) && filename) {
-    const baseFilename = filename
-      .replace(/\\/g, '/')
-      .split('/')
-      .pop()
-      ?.replace(/\.[a-zA-Z0-9]+$/, '') ?? '';
+    const baseFilename =
+      filename
+        .replace(/\\/g, '/')
+        .split('/')
+        .pop()
+        ?.replace(/\.[a-zA-Z0-9]+$/, '') ?? '';
 
     const fileDottedId = baseFilename.match(
       /(?:^|[_-\s])(\d{2,4}(?:\.\d{2,4}){2,4}|\d{8,15})(?:$|[_-\s])/
@@ -267,7 +304,9 @@ class RetryableGradingError extends Error {
   constructor(
     message: string,
     public readonly statusCode?: number,
-    public readonly cause?: unknown
+    public readonly cause?: unknown,
+    public readonly rotatedModel: boolean = false,
+    public readonly retryDelayMs?: number
   ) {
     super(message);
     this.name = 'RetryableGradingError';
@@ -279,6 +318,8 @@ class RetryableGradingError extends Error {
  * dilengkapi dengan:
  * - Empty Text Pre-Filter (< 20 kata bypass langsung di backend tanpa panggil API Gemini)
  * - Token Exhaustion Guard (hard truncate maksimal 30.000 karakter)
+ * - Multi-Model Quota Rotation saat HTTP 429 / 404 (beralih instan antar model Free Tier)
+ * - Smart Retry Delay (membaca retryDelay dari error JSON Google, dibatasi maks 15 detik)
  * - Fallback Ekstraksi Identitas Lokal (Regex teks & nama file)
  * - Validasi kontrak JSON via Zod dan kalkulasi ulang skor akhir secara deterministik.
  */
@@ -337,6 +378,8 @@ export async function evaluateDocument(
 
   const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
   const baseDelayMs = options.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
+  const maxRetryDelayMs =
+    options.maxRetryDelayMs ?? MAX_SMART_RETRY_DELAY_MS;
   const temperature = options.temperature ?? DEFAULT_TEMPERATURE;
 
   const { systemInstruction, userPrompt } = buildGradingPrompt({
@@ -378,28 +421,53 @@ export async function evaluateDocument(
       if (!response.ok) {
         const errorBody = await response.text().catch(() => '');
 
-        // Fallback model otomatis jika model tidak ditemukan (HTTP 404)
-        if (response.status === 404) {
-          const nextFallback = FALLBACK_GEMINI_MODELS.find(
+        // Multi-Model Quota Rotation saat terkena HTTP 429 (Rate Limit / RESOURCE_EXHAUSTED) atau HTTP 404
+        if (response.status === 429 || response.status === 404) {
+          const nextRotationModel = GEMINI_ROTATION_MODELS.find(
             (m) => !triedModels.has(m)
           );
-          if (nextFallback) {
-            currentModel = nextFallback;
-            triedModels.add(nextFallback);
+
+          if (nextRotationModel) {
+            const prevModel = currentModel;
+            currentModel = nextRotationModel;
+            triedModels.add(nextRotationModel);
             throw new RetryableGradingError(
-              `Gemini API HTTP 404 pada model sebelumnya, beralih ke fallback model ${nextFallback}: ${errorBody || response.statusText}`,
-              404
+              `Gemini API HTTP ${response.status} pada model ${prevModel}, rotasi langsung ke model ${nextRotationModel}: ${errorBody || response.statusText}`,
+              response.status,
+              undefined,
+              true
+            );
+          }
+
+          // Jika seluruh model di daftar rotasi sudah dicoba dan terkena 429:
+          // Reset daftar rotasi ke model pertama dan gunakan Smart Retry Delay dari response JSON Google
+          if (response.status === 429) {
+            triedModels.clear();
+            currentModel = GEMINI_ROTATION_MODELS[0];
+            triedModels.add(currentModel);
+
+            const smartDelayMs = parseGoogleRetryDelayMs(
+              errorBody,
+              maxRetryDelayMs
+            );
+            throw new RetryableGradingError(
+              `Seluruh model rotasi terkena HTTP 429: ${errorBody || response.statusText}`,
+              429,
+              undefined,
+              false,
+              smartDelayMs ?? undefined
             );
           }
         }
 
-        // Rate limit (429) atau Server Error (5xx) dapat di-retry
-        if (response.status === 429 || response.status >= 500) {
+        // Server Error (5xx) dapat di-retry
+        if (response.status >= 500) {
           throw new RetryableGradingError(
             `Gemini API HTTP ${response.status}: ${errorBody || response.statusText}`,
             response.status
           );
         }
+
         throw new Error(
           `Gemini API gagal dengan status ${response.status}: ${errorBody || response.statusText}`
         );
@@ -458,8 +526,21 @@ export async function evaluateDocument(
         break;
       }
 
-      const backoffDelay = baseDelayMs * Math.pow(2, attempt);
-      await sleep(backoffDelay);
+      if (error instanceof RetryableGradingError && error.rotatedModel) {
+        // Jangan menunggu lama ketika melakukan failover ke model berbeda karena kuota dihitung PerModel
+        const quickSwitchDelay = Math.min(baseDelayMs, 15);
+        if (quickSwitchDelay > 0) {
+          await sleep(quickSwitchDelay);
+        }
+      } else if (
+        error instanceof RetryableGradingError &&
+        typeof error.retryDelayMs === 'number'
+      ) {
+        await sleep(error.retryDelayMs);
+      } else {
+        const backoffDelay = baseDelayMs * Math.pow(2, attempt);
+        await sleep(backoffDelay);
+      }
     }
   }
 

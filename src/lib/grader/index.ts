@@ -27,6 +27,9 @@ export {
 export {
   MIN_DOCUMENT_WORD_COUNT,
   EMPTY_DOCUMENT_REASONING,
+  GEMINI_ROTATION_MODELS,
+  MAX_SMART_RETRY_DELAY_MS,
+  parseGoogleRetryDelayMs,
   countDocumentWords,
   extractIdentityFallback,
   applyIdentityFallback,
@@ -37,6 +40,8 @@ export {
 } from './evaluator';
 
 export {
+  DEFAULT_SAMPLE_SIZE,
+  DEFAULT_BATCH_CONCURRENCY,
   runCalibrationSample,
   runBatchGradingQueue,
   type BatchInputDocument,

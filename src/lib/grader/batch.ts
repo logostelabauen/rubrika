@@ -70,8 +70,8 @@ export interface BatchGradingQueueOptions extends EvaluateDocumentOptions {
   ) => void;
 }
 
-const DEFAULT_SAMPLE_SIZE = 3;
-const DEFAULT_BATCH_CONCURRENCY = 5;
+export const DEFAULT_SAMPLE_SIZE = 3;
+export const DEFAULT_BATCH_CONCURRENCY = 3;
 
 const DEFAULT_INTEGRITY_CHECK: IntegrityCheckResult = {
   similarity_flagged: false,

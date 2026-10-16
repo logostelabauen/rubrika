@@ -1,0 +1,69 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                 String              @id @default(cuid())
+  email              String              @unique
+  name               String
+  creditBalance      Int                 @default(30)
+  createdAt          DateTime            @default(now())
+  creditTransactions CreditTransaction[]
+  gradingSessions    GradingSession[]
+}
+
+model CreditTransaction {
+  id          String   @id @default(cuid())
+  userId      String
+  amount      Int      // Positif untuk top-up QRIS, negatif untuk pemotongan batch
+  description String
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model GradingSession {
+  id                  String       @id @default(cuid())
+  userId              String
+  title               String
+  assignmentContext   String
+  rubricCriteriaJson  String       // JSON string dari RubricCriterion[]
+  tone                String       @default("Balanced") // "Lenient" | "Balanced" | "Rigorous"
+  calibrationNotes    String?
+  calibrationRunsUsed Int          @default(0) // Maksimal 2x gratis per sesi
+  status              String       @default("DRAFT") // "DRAFT" | "CALIBRATING" | "PROCESSING" | "COMPLETED"
+  createdAt           DateTime     @default(now())
+  submissions         Submission[]
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Submission {
+  id                   String   @id @default(cuid())
+  sessionId            String
+  filename             String
+  extractedStudentName String   @default("Tidak Tertera")
+  extractedStudentId   String   @default("Tidak Tertera")
+  extractedText        String
+  similarityFlagged    Boolean  @default(false)
+  maxSimilarityScore   Float    @default(0.0)
+  closestMatchFile     String?
+  evaluationJson       String?  // JSON string dari GradingOutput
+  finalWeightedScore   Float?
+  aiWritingSuspicion   String?  // "Low" | "Medium" | "High"
+  status               String   @default("PENDING") // "PENDING" | "COMPLETED" | "MANUAL_REVIEW_REQUIRED"
+  updatedAt            DateTime @updatedAt
+
+  session GradingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+}

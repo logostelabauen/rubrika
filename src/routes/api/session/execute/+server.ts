@@ -1,6 +1,7 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import {
+  calculateBatchCreditSettlement,
   checkBatchCreditSufficiency,
   INITIAL_FREE_CREDITS,
   TOPUP_PACKAGE
@@ -75,8 +76,6 @@ export const POST: RequestHandler = async ({ request }) => {
       );
     }
 
-    const remainingBalance = creditCheck.currentBalance - creditCheck.required;
-
     const results = await runBatchGradingQueue(
       documents,
       similarityResults,
@@ -95,13 +94,15 @@ export const POST: RequestHandler = async ({ request }) => {
       (r) => r.status === 'MANUAL_REVIEW_REQUIRED'
     ).length;
 
+    const creditSummary = calculateBatchCreditSettlement(
+      creditCheck.currentBalance,
+      results.length,
+      manualReviewCount
+    );
+
     return json({
       results,
-      creditSummary: {
-        previousBalance: creditCheck.currentBalance,
-        deducted: creditCheck.required,
-        remainingBalance
-      },
+      creditSummary,
       batchSummary: {
         totalProcessed: results.length,
         completedCount,

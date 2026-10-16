@@ -18,6 +18,8 @@ export interface ExtractedDocument {
 }
 
 const MAX_ZIP_RECURSION_DEPTH = 3;
+export const MAX_ZIP_ENTRIES = 100;
+export const MAX_EXTRACTED_FILE_BYTES = 5 * 1024 * 1024; // 5 MB per file
 
 /**
  * Membersihkan whitespace berlebih (spasi ganda, tab, dan baris kosong beruntun)
@@ -98,7 +100,8 @@ function toBuffer(input: Buffer | Uint8Array): Buffer {
  * sehingga dapat membongkar `.zip` maupun `.docx` tanpa bergantung pada paket native eksternal.
  */
 function readZipEntriesNative(
-  zipBuffer: Buffer
+  zipBuffer: Buffer,
+  enforceFileCountLimit: boolean = true
 ): { path: string; data: Buffer }[] {
   // Cari End of Central Directory (EOCD) signature: 0x06054b50
   let eocdOffset = -1;
@@ -120,6 +123,7 @@ function readZipEntriesNative(
 
   const entries: { path: string; data: Buffer }[] = [];
   let offset = centralDirOffset;
+  let validFileCount = 0;
 
   for (let i = 0; i < totalEntries && offset + 46 <= zipBuffer.length; i++) {
     const signature = zipBuffer.readUInt32LE(offset);
@@ -129,6 +133,7 @@ function readZipEntriesNative(
 
     const compressionMethod = zipBuffer.readUInt16LE(offset + 10);
     const compressedSize = zipBuffer.readUInt32LE(offset + 20);
+    const uncompressedSize = zipBuffer.readUInt32LE(offset + 24);
     const fileNameLength = zipBuffer.readUInt16LE(offset + 28);
     const extraFieldLength = zipBuffer.readUInt16LE(offset + 30);
     const fileCommentLength = zipBuffer.readUInt16LE(offset + 32);
@@ -143,6 +148,24 @@ function readZipEntriesNative(
     // Lewati direktori
     if (entryPath.endsWith('/')) {
       continue;
+    }
+
+    if (enforceFileCountLimit && !isIgnoredSystemPath(entryPath)) {
+      validFileCount += 1;
+      if (validFileCount > MAX_ZIP_ENTRIES) {
+        throw new Error(
+          `Arsip ZIP melebihi batas keamanan maksimal ${MAX_ZIP_ENTRIES} file dalam 1 arsip (ZIP Bomb / DoS Guard).`
+        );
+      }
+    }
+
+    if (
+      uncompressedSize > MAX_EXTRACTED_FILE_BYTES ||
+      compressedSize > MAX_EXTRACTED_FILE_BYTES
+    ) {
+      throw new Error(
+        `Ukuran ekstraksi file "${entryPath}" melebihi batas keamanan maksimal 5 MB.`
+      );
     }
 
     if (localHeaderOffset + 30 > zipBuffer.length) {
@@ -166,10 +189,26 @@ function readZipEntriesNative(
     if (compressionMethod === 0) {
       uncompressedData = Buffer.from(compressedData);
     } else if (compressionMethod === 8) {
-      uncompressedData = inflateRawSync(compressedData);
+      try {
+        uncompressedData = inflateRawSync(compressedData, {
+          maxOutputLength: MAX_EXTRACTED_FILE_BYTES
+        });
+      } catch (zlibErr) {
+        const msg =
+          zlibErr instanceof Error ? zlibErr.message : String(zlibErr);
+        throw new Error(
+          `Gagal dekompresi entri "${entryPath}" (kemungkinan melebihi batas 5 MB): ${msg}`
+        );
+      }
     } else {
       throw new Error(
         `Metode kompresi ZIP (${compressionMethod}) tidak didukung pada entri: ${entryPath}`
+      );
+    }
+
+    if (uncompressedData.length > MAX_EXTRACTED_FILE_BYTES) {
+      throw new Error(
+        `Ukuran ekstraksi file "${entryPath}" melebihi batas keamanan maksimal 5 MB.`
       );
     }
 
@@ -211,7 +250,7 @@ async function extractDocxText(buffer: Buffer): Promise<string> {
     // Gunakan fallback native parser jika mammoth belum terinstal
   }
 
-  const entries = readZipEntriesNative(buffer);
+  const entries = readZipEntriesNative(buffer, false);
   const docXmlEntry = entries.find(
     (entry) => entry.path.replace(/\\/g, '/') === 'word/document.xml'
   );
@@ -296,6 +335,12 @@ async function parseSingleDocument(
   try {
     if (buffer.length === 0) {
       throw new Error('File kosong (0 byte).');
+    }
+
+    if (buffer.length > MAX_EXTRACTED_FILE_BYTES) {
+      throw new Error(
+        `Ukuran file "${cleanName}" melebihi batas keamanan maksimal 5 MB.`
+      );
     }
 
     let rawText = '';

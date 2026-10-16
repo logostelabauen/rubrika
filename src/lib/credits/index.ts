@@ -20,6 +20,13 @@ export interface BatchCreditSufficiencyResult {
   topupOffer?: typeof TOPUP_PACKAGE;
 }
 
+export interface BatchCreditSettlement {
+  previousBalance: number;
+  deducted: number;
+  refundedCredits: number;
+  remainingBalance: number;
+}
+
 /**
  * Memeriksa apakah dosen masih memiliki jatah uji sampel kalibrasi gratis
  * pada sesi penilaian saat ini (maksimal 2x kalibrasi gratis per sesi).
@@ -69,5 +76,31 @@ export function checkBatchCreditSufficiency(
     required,
     currentBalance,
     deficit: 0
+  };
+}
+
+/**
+ * Menghitung pemotongan kredit atomik beserta auto-refund otomatis untuk dokumen
+ * yang gagal diproses (berstatus 'MANUAL_REVIEW_REQUIRED') akibat gangguan API.
+ */
+export function calculateBatchCreditSettlement(
+  initialBalance: number,
+  totalDocuments: number,
+  failedDocumentCount: number
+): BatchCreditSettlement {
+  const previousBalance = Math.max(0, Math.floor(initialBalance));
+  const totalRequested = Math.max(0, Math.floor(totalDocuments));
+  const refundedCredits = Math.min(
+    totalRequested,
+    Math.max(0, Math.floor(failedDocumentCount))
+  );
+  const deducted = Math.max(0, totalRequested - refundedCredits);
+  const remainingBalance = Math.max(0, previousBalance - deducted);
+
+  return {
+    previousBalance,
+    deducted,
+    refundedCredits,
+    remainingBalance
   };
 }

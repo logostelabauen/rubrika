@@ -99,7 +99,20 @@
     );
   }
 
+  $: bypassedDocCount = extractedDocuments.filter(
+    (doc) => doc.wordCount < 20
+  ).length;
+  $: activeLlmDocCount = Math.max(
+    0,
+    extractedDocuments.length - bypassedDocCount
+  );
+  $: estimatedBatchSeconds =
+    activeLlmDocCount === 0
+      ? 1
+      : Math.max(2, Math.ceil(activeLlmDocCount / 5) * 3);
+
   async function handleFileUpload(fileList: FileList | File[]) {
+    if (isParsing) return;
     const files = Array.from(fileList);
     if (files.length === 0) return;
 
@@ -136,6 +149,7 @@
   }
 
   async function loadDemoDocuments() {
+    if (isParsing) return;
     errorMessage = '';
     statusNotice = '';
     isParsing = true;
@@ -243,8 +257,13 @@ Referensi:
   let isExecutingBatch = false;
   let calibrationSamples: CalibrationSampleItem[] = [];
   let remainingDocsAfterSample: ExtractedDocument[] = [];
+  let lastRefundedCredits = 0;
 
   async function triggerCalibrationSample() {
+    // In-flight lock mencegah klik ganda / race condition
+    if (isCalibrating || isExecutingBatch) return;
+    if (calibrationRunsUsed >= MAX_FREE_CALIBRATION_RUNS) return;
+
     errorMessage = '';
     statusNotice = '';
     isCalibrating = true;
@@ -291,12 +310,14 @@ Referensi:
   let isExporting = false;
 
   async function executeRemainingOrFullBatch() {
+    // In-flight lock mencegah spam klik / pemotongan kuota ganda
+    if (isExecutingBatch || isCalibrating) return;
+
     errorMessage = '';
     statusNotice = '';
+    lastRefundedCredits = 0;
     isExecutingBatch = true;
 
-    // Jika sampel kalibrasi sudah sukses dan tidak ada perubahan catatan kalibrasi baru,
-    // kita dapat memproses sisa dokumen dan menggabungkannya, atau memproses seluruh dokumen dengan instruksi kalibrasi terbaru.
     const docsToProcess = extractedDocuments;
 
     try {
@@ -332,8 +353,14 @@ Referensi:
 
       batchResults = data.results;
       creditBalance = data.creditSummary.remainingBalance;
+      lastRefundedCredits = Number(data.creditSummary.refundedCredits ?? 0);
       currentStep = 4;
-      statusNotice = `Penilaian batch selesai! ${data.batchSummary.completedCount} dokumen berhasil dinilai (${data.creditSummary.deducted} kredit terpakai).`;
+
+      if (lastRefundedCredits > 0) {
+        statusNotice = `Penilaian batch selesai! ${data.batchSummary.completedCount} dokumen berhasil dinilai, dan +${lastRefundedCredits} Kredit otomatis di-refund karena ${lastRefundedCredits} dokumen membutuhkan tinjauan manual.`;
+      } else {
+        statusNotice = `Penilaian batch selesai! ${data.batchSummary.completedCount} dokumen berhasil dinilai (${data.creditSummary.deducted} kredit terpakai).`;
+      }
     } catch (err) {
       errorMessage =
         err instanceof Error ? err.message : 'Gagal mengeksekusi batch.';
@@ -892,7 +919,14 @@ Referensi:
                       <td class="px-4 py-3 uppercase text-xs font-semibold text-slate-500">
                         {doc.fileType}
                       </td>
-                      <td class="px-4 py-3 text-slate-700">{doc.wordCount} kata</td>
+                      <td class="px-4 py-3 text-slate-700">
+                        {doc.wordCount} kata
+                        {#if doc.wordCount < 20}
+                          <span class="block text-[11px] font-semibold text-amber-700 mt-0.5">
+                            ⚡ Auto-Bypass API (&lt; 20 kata • 0 Token)
+                          </span>
+                        {/if}
+                      </td>
                       <td class="px-4 py-3">
                         {#if sim.similarity_flagged}
                           <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold bg-red-100 text-red-800 border border-red-200">
@@ -953,7 +987,7 @@ Referensi:
             </span>
             <button
               type="button"
-              disabled={isCalibrating || calibrationRunsUsed >= MAX_FREE_CALIBRATION_RUNS}
+              disabled={isCalibrating || isExecutingBatch || calibrationRunsUsed >= MAX_FREE_CALIBRATION_RUNS}
               on:click={triggerCalibrationSample}
               class="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:bg-slate-300 text-white text-xs font-semibold transition"
             >
@@ -963,6 +997,24 @@ Referensi:
                   ? '🔄 Uji Ulang 3 Sampel'
                   : '▶️ Jalankan Uji 3 Sampel (Gratis)'}
             </button>
+          </div>
+        </div>
+
+        <!-- Ringkasan Estimasi Waktu Proses & Auto-Bypass -->
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 p-4 rounded-xl bg-slate-50 border border-slate-200 text-xs">
+          <div>
+            <span class="text-slate-500 block">Total Antrean Batch</span>
+            <strong class="text-sm text-slate-900">{extractedDocuments.length} Dokumen (5x Paralel)</strong>
+          </div>
+          <div>
+            <span class="text-slate-500 block">Estimasi Waktu Proses</span>
+            <strong class="text-sm text-indigo-700">~{estimatedBatchSeconds} detik</strong>
+          </div>
+          <div>
+            <span class="text-slate-500 block">Pre-Filter &lt; 20 Kata (Auto-Bypass)</span>
+            <strong class="text-sm text-amber-700">
+              {bypassedDocCount} Dokumen (Hemat Token API)
+            </strong>
           </div>
         </div>
 
@@ -1056,12 +1108,12 @@ Referensi:
 
           <button
             type="button"
-            disabled={isExecutingBatch}
+            disabled={isExecutingBatch || isCalibrating}
             on:click={executeRemainingOrFullBatch}
             class="px-6 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white text-sm font-semibold shadow-sm transition"
           >
             {isExecutingBatch
-              ? `Memproses ${extractedDocuments.length} Dokumen (Paralel)...`
+              ? `Memproses ${extractedDocuments.length} Dokumen (~${estimatedBatchSeconds}s)...`
               : `🚀 Proses Semua Dokumen (${extractedDocuments.length} Kredit)`}
           </button>
         </div>
@@ -1073,9 +1125,16 @@ Referensi:
       <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
         <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div>
-            <h2 class="text-xl font-bold text-slate-900">
-              Langkah 4: Review Nilai, Edit Inline & Export Gradebook
-            </h2>
+            <div class="flex items-center gap-2.5 flex-wrap">
+              <h2 class="text-xl font-bold text-slate-900">
+                Langkah 4: Review Nilai, Edit Inline & Export Gradebook
+              </h2>
+              {#if lastRefundedCredits > 0}
+                <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                  💸 Auto-Refund +{lastRefundedCredits} Kredit (Dokumen Gagal API)
+                </span>
+              {/if}
+            </div>
             <p class="text-sm text-slate-500 mt-1">
               Klik nilai akhir untuk mengedit langsung, atau klik <strong>Detail & Feedback</strong> untuk meninjau alasan per kriteria.
             </p>
@@ -1128,7 +1187,11 @@ Referensi:
                     {item.filename}
                     {#if item.status === 'MANUAL_REVIEW_REQUIRED'}
                       <span class="block text-[11px] font-semibold text-amber-700 mt-0.5">
-                        ⚠️ MANUAL_REVIEW_REQUIRED
+                        ⚠️ MANUAL_REVIEW_REQUIRED (Kredit Di-refund)
+                      </span>
+                    {:else if item.evaluation?.grading_breakdown?.[0]?.short_reasoning?.includes('Tidak memotong token API')}
+                      <span class="block text-[11px] font-semibold text-slate-500 mt-0.5">
+                        ⚡ Auto-Bypass (&lt; 20 kata)
                       </span>
                     {/if}
                   </td>

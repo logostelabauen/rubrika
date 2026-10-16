@@ -13,6 +13,9 @@ export {
 export {
   RUBRIKA_SYSTEM_INSTRUCTION,
   TONE_DIRECTIVES,
+  MAX_DOCUMENT_CHAR_LENGTH,
+  truncateDocumentText,
+  sanitizeStudentSubmissionText,
   formatRubricCriteriaList,
   buildGradingPrompt,
   type GradingTone,
@@ -22,9 +25,15 @@ export {
 } from './prompt';
 
 export {
+  MIN_DOCUMENT_WORD_COUNT,
+  EMPTY_DOCUMENT_REASONING,
+  countDocumentWords,
+  extractIdentityFallback,
+  applyIdentityFallback,
   verifyAndRecalculateScore,
   evaluateDocument,
-  type EvaluateDocumentOptions
+  type EvaluateDocumentOptions,
+  type ExtractedIdentityFallback
 } from './evaluator';
 
 export {

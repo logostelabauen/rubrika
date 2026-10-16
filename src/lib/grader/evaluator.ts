@@ -63,14 +63,20 @@ export async function evaluateDocument(
   params: BuildGradingPromptParams,
   options: EvaluateDocumentOptions = {}
 ): Promise<GradingOutput> {
-  const apiKey = options.apiKey ?? process.env.LLM_API_KEY ?? process.env.GEMINI_API_KEY;
+  const apiKey =
+    options.apiKey?.trim() ||
+    process.env.LLM_API_KEY?.trim() ||
+    process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) {
     throw new Error(
       'Missing API Key: Berikan options.apiKey atau set environment variable LLM_API_KEY / GEMINI_API_KEY.'
     );
   }
 
-  const model = options.model ?? DEFAULT_GEMINI_MODEL;
+  const model =
+    options.model?.trim() ||
+    process.env.GEMINI_MODEL?.trim() ||
+    DEFAULT_GEMINI_MODEL;
   const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
   const baseDelayMs = options.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
   const temperature = options.temperature ?? DEFAULT_TEMPERATURE;

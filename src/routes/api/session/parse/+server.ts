@@ -1,4 +1,5 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
+import { env } from '$env/dynamic/private';
 import {
   parseUploadedFiles,
   type UploadedFileInput
@@ -9,7 +10,9 @@ export const POST: RequestHandler = async ({ request }) => {
   try {
     const contentType = request.headers.get('content-type') ?? '';
     const uploadedInputs: UploadedFileInput[] = [];
-    let threshold = Number(process.env.SIMILARITY_THRESHOLD ?? 0.8);
+    let threshold = Number(
+      env.SIMILARITY_THRESHOLD || process.env.SIMILARITY_THRESHOLD || 0.8
+    );
 
     if (contentType.includes('multipart/form-data')) {
       const formData = await request.formData();

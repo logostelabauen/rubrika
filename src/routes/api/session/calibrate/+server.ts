@@ -1,4 +1,5 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
+import { env } from '$env/dynamic/private';
 import {
   canRunCalibration,
   MAX_FREE_CALIBRATION_RUNS
@@ -18,8 +19,16 @@ export const POST: RequestHandler = async ({ request }) => {
     const gradingConfig: GradingConfig | undefined = body?.gradingConfig;
     const calibrationRunsUsed = Number(body?.calibrationRunsUsed ?? 0);
     const sampleSize = Number(body?.sampleSize ?? 3);
-    const apiKey: string | undefined = body?.apiKey;
-    const model: string | undefined = body?.model;
+    const resolvedApiKey =
+      body?.apiKey?.trim() ||
+      env.LLM_API_KEY?.trim() ||
+      env.GEMINI_API_KEY?.trim() ||
+      process.env.LLM_API_KEY?.trim() ||
+      process.env.GEMINI_API_KEY?.trim();
+    const resolvedModel =
+      body?.model?.trim() ||
+      env.GEMINI_MODEL?.trim() ||
+      process.env.GEMINI_MODEL?.trim();
 
     if (documents.length === 0) {
       return json(
@@ -57,7 +66,7 @@ export const POST: RequestHandler = async ({ request }) => {
       documents,
       gradingConfig,
       sampleSize,
-      { apiKey, model }
+      { apiKey: resolvedApiKey, model: resolvedModel }
     );
 
     const updatedRunsUsed = calibrationRunsUsed + 1;

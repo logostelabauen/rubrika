@@ -13,23 +13,39 @@ By combining local vector-based similarity detection with structured Large Langu
 Rubrika decouples text extraction and plagiarism detection from LLM inference to minimize operational costs and latency.
 
 ```text
-[Ingestion Layer]       Bulk PDF / DOCX / ZIP Archive Upload
+[Ingestion Layer]       Bulk PDF / DOCX / TXT / ZIP Archive Upload
         │
         ▼
-[Extraction Engine]     Local raw text parsing & metadata normalization
+[Extraction Engine]     Local raw text parsing & whitespace normalization
         │
         ▼
-[Similarity Matrix]     Pairwise TF-IDF & Cosine Similarity computation (Zero API Cost)
+[Similarity Matrix]     Pairwise TF-IDF (1-gram & 2-gram) & Cosine Similarity (Zero API Cost)
         │
         ▼
-[Calibration Gate]      3-Sample dry run ──► Instructor validation & rubric adjustment
+[Calibration Gate]      3-Sample dry run (Free) ──► Instructor validation & rubric/note revision
         │
         ▼
-[Inference Queue]       Asynchronous worker pool ──► LLM Structured JSON Evaluation
+[Credit Wallet Guard]   Atomic quota verification (1 Credit = 1 Document) & instant QRIS Top-Up
         │
         ▼
-[Export & Persistence]  PostgreSQL/SQLite storage ──► Interactive UI & .XLSX Gradebook
+[Inference Queue]       Promise-based concurrent worker pool ──► LLM Structured JSON Evaluation
+        │
+        ▼
+[Export & Persistence]  Deterministic score verification ──► Interactive UI & .CSV / Excel Gradebook
 ```
+
+---
+
+## End-to-End 4-Step Instructor Workflow
+
+1. **Setup Tugas & Rubrik (Step 1):**
+   Configure the assignment context, dynamically add/remove weighted rubric criteria (validated in real-time to total 100%), and select the grading tone (`Lenient`, `Balanced`, or `Rigorous`).
+2. **Bulk Upload & Local Similarity Check (Step 2):**
+   Drag-and-drop multiple `.pdf`, `.docx`, `.txt` files or a single `.zip` bundle (e.g., exported from Google Classroom or Moodle). Instantly computes pairwise TF-IDF Cosine Similarity at zero API token cost.
+3. **3-Sample Calibration & Batch Execution (Step 3):**
+   Run a free dry-run calibration on the first 3 documents (up to 2 free calibration runs per session). Review initial AI grading behavior, inject custom instructor calibration notes (`calibrationNotes`), and execute the remaining batch through the concurrent worker pool.
+4. **Interactive Review, Inline Editing & Export (Step 4):**
+   Inspect results in an interactive table featuring similarity alerts (`≥ 80%`), AI writing suspicion badges (`Low` / `Medium` / `High`), inline score editing with automatic weighted recalculation, detailed per-criterion reasoning modals, and one-click export to Excel-ready `.csv` (UTF-8 with BOM & formula-injection protection).
 
 ---
 
@@ -37,76 +53,96 @@ Rubrika decouples text extraction and plagiarism detection from LLM inference to
 
 | Module | Technical Implementation | Operational Benefit |
 | :--- | :--- | :--- |
-| **Batch Ingestion** | Stream-based `.zip`, `.pdf`, and `.docx` parser with asynchronous task queuing. | Processes 50–200+ assignments concurrently without browser timeouts or API rate-limit failures. |
-| **Local Similarity Engine** | In-memory $n$-gram vectorization and pairwise Cosine Similarity ($S_C$) calculation prior to LLM calls. | Flags peer-to-peer copy-pasting across a class batch at zero token cost. |
-| **Sample Calibration** | Evaluates an initial $N=3$ subset before locking batch execution. | Allows instructors to fine-tune grading strictness and rubric weights before consuming compute credits. |
-| **Deterministic Grading** | Enforces strict JSON Schema validation on LLM responses. | Guarantees 100% parseable outputs (Extracted Name/NIM, criterion scores, reasoning, and student feedback). |
-| **Gradebook Compiler** | Automated mapping from relational JSON records to `.xlsx` and `.csv` buffers. | Generates administrative-ready spreadsheets compatible with university portals and LMS platforms. |
+| **Batch Ingestion** | Multi-format `.zip`, `.pdf`, `.docx`, and `.txt` parser (`src/lib/parser/`). | Unpacks archives recursively, strips OS artifacts (`__MACOSX`), and normalizes text without failing the batch on corrupt files. |
+| **Local Similarity Engine** | In-memory unigram + bigram TF-IDF vectorization and pairwise Cosine Similarity ($S_C$) (`src/lib/similarity/`). | Flags peer-to-peer copy-pasting across a class batch at zero token cost before any LLM call is made. |
+| **Sample Calibration** | Evaluates an initial $N=3$ subset before locking batch execution (`runCalibrationSample`). | Allows instructors to fine-tune grading strictness and rubric instructions before consuming document credits. |
+| **Deterministic Grading** | Enforces strict JSON Schema (`responseSchema`) & Zod validation (`GradingOutputSchema`) + backend score recalculation (`verifyAndRecalculateScore`). | Guarantees 100% parseable outputs and eliminates LLM floating-point arithmetic hallucinations. |
+| **Credit Wallet System** | Built-in quota guard (`src/lib/credits/`) with 30 free initial credits, free calibration gate, and HTTP 402 QRIS top-up trigger. | Frictionless pay-per-document monetization without complex subscription barriers. |
+| **Gradebook Compiler** | Automated mapping from evaluated JSON records to UTF-8 BOM `.csv` / Excel buffers (`src/lib/exporter/`). | Generates administrative-ready spreadsheets compatible with Microsoft Excel, university portals, and LMS platforms. |
 
 ---
 
 ## Mathematical & Scoring Specification
 
 1. **Cross-Submission Similarity:**
-   Prior to grading, each extracted document $D_i$ is converted into a TF-IDF vector $\mathbf{v}_i$. Pairwise similarity across a batch of $m$ documents is computed as:
+   Prior to grading, each extracted document $D_i$ is tokenized (with Indonesian and English stopword removal) into unigram and bigram TF-IDF vectors $\mathbf{v}_i$. Pairwise similarity across a batch of $m$ documents is computed as:
    $$S_C(D_i, D_j) = \frac{\mathbf{v}_i \cdot \mathbf{v}_j}{\|\mathbf{v}_i\| \|\mathbf{v}_j\|}$$
-   Submissions exceeding the configurable threshold ($\tau \ge 0.80$) are flagged for manual review.
+   Submissions exceeding the configurable threshold ($\tau \ge 0.80$) are automatically flagged (`similarity_flagged: true`) along with `closest_match_file`.
 
-2. **Weighted Rubric Calculation:**
-   For a rubric with $k$ criteria, where each criterion $c$ has an assigned weight $w_c$ (such that $\sum_{c=1}^{k} w_c = 1.0$) and an LLM-assigned score $s_c \in [0, 100]$, the final grade $G$ is deterministically verified on the backend:
-   $$G = \sum_{c=1}^{k} (w_c \cdot s_c)$$
+2. **Deterministic Weighted Rubric Calculation:**
+   For a rubric with $k$ criteria, where each criterion $c$ has a percentage weight $w_c$ ($\sum_{c=1}^{k} w_c = 100$) and an LLM-assigned integer score $s_c \in [0, 100]$, the final grade $G$ is deterministically verified and overridden on the backend:
+   $$G = \text{round}\left(\sum_{c=1}^{k} s_c \cdot \frac{w_c}{100},\ 2\right)$$
 
 ---
 
 ## Deterministic Output Schema
 
-Every evaluated document is strictly validated against the following payload contract before persistence:
+Every evaluated document is strictly validated against `GradingOutputSchema` (`src/lib/grader/schema.ts`) and wrapped into a `BatchDocumentResult`:
 
 ```json
 {
-  "metadata": {
-    "filename": "UAS_SistemInformasi_Budi.pdf",
-    "extracted_student_name": "Budi Santoso",
-    "extracted_student_id": "1122025100045",
-    "processed_at": "2026-10-15T16:50:00Z"
-  },
+  "document_id": "doc_01",
+  "filename": "UAS_RPL_1122045_Revisi.pdf",
+  "status": "COMPLETED",
+  "processed_at": "2026-10-16T07:00:00.000Z",
   "integrity_check": {
     "similarity_flagged": false,
     "max_similarity_score": 0.18,
-    "closest_match_file": "UAS_SistemInformasi_Andi.pdf"
+    "closest_match_file": "UAS_RPL_Andi.pdf"
   },
   "evaluation": {
-    "criteria_breakdown": [
+    "student_identity": {
+      "extracted_name": "Rizky Pratama",
+      "extracted_id": "112204510088",
+      "filename": "UAS_RPL_1122045_Revisi.pdf"
+    },
+    "grading_breakdown": [
       {
-        "criterion_id": "crit_01",
-        "name": "Ketepatan Analisis Studi Kasus",
-        "weight": 0.50,
-        "score": 86,
-        "justification": "Demonstrates strong understanding of system bottlenecks, though mitigation steps lack cost estimation."
+        "criterion_name": "Kedalaman Analisis Teknis",
+        "weight_percentage": 50,
+        "score_given": 80,
+        "short_reasoning": "Penjelasan mengenai trade-off latency, kompleksitas DevOps, dan skalabilitas disajikan secara padat dan tepat."
       },
       {
-        "criterion_id": "crit_02",
-        "name": "Struktur & Referensi Akademik",
-        "weight": 0.50,
-        "score": 80,
-        "justification": "Coherent structure and proper citation formatting, but relies heavily on secondary sources."
+        "criterion_name": "Studi Kasus & Relevansi",
+        "weight_percentage": 30,
+        "score_given": 85,
+        "short_reasoning": "Skenario migrasi pada aplikasi tiket konser dan indikator kesiapan tim disajikan secara konkret dan relevan."
+      },
+      {
+        "criterion_name": "Referensi & Sitasi",
+        "weight_percentage": 20,
+        "score_given": 65,
+        "short_reasoning": "Sesuai catatan kalibrasi dosen, diberikan nilai penyesuaian karena mencantumkan rujukan buku kredibel."
       }
     ],
-    "final_weighted_score": 83.0,
-    "constructive_feedback": "Analisis studi kasus sudah sangat tajam. Untuk pengembangan selanjutnya, lengkapi rekomendasi solusi dengan estimasi dampak operasional dan gunakan referensi jurnal primer."
+    "final_weighted_score": 78.5,
+    "feedback_for_student": "Analisis konsep arsitektur dan studi kasus migrasi yang Anda susun sudah sangat baik dan kontekstual. Untuk tugas berikutnya, pastikan daftar pustaka tertulis lengkap sesuai batas minimal.",
+    "ai_writing_suspicion": "Low"
   }
 }
 ```
 
 ---
 
-## System Requirements & Stack
+## API Endpoints
 
-* **Runtime Environment:** Node.js ($\ge 20.\text{x}$) or Python ($\ge 3.11$)
-* **Web Framework:** SvelteKit / React with Tailwind CSS
-* **Database:** PostgreSQL or SQLite (via Prisma / Drizzle / SQLAlchemy)
-* **LLM Provider:** Google Gemini 1.5 Flash / OpenAI API (Structured Outputs enabled)
-* **Document Processing:** Local PDF/DOCX text extraction libraries
+| Endpoint | Method | Description |
+| :--- | :---: | :--- |
+| `/api/session/parse` | `POST` | Accepts `multipart/form-data` uploads (`.pdf`, `.docx`, `.txt`, `.zip`), extracts normalized text, and computes the local TF-IDF similarity matrix. |
+| `/api/session/calibrate` | `POST` | Validates free calibration quota (`MAX_FREE_CALIBRATION_RUNS = 2`) and evaluates the first $N=3$ sample documents in parallel. |
+| `/api/session/execute` | `POST` | Verifies credit balance (`HTTP 402` with QRIS top-up offer if insufficient) and executes the remaining batch via the concurrent worker pool (`default concurrency = 5`). |
+| `/api/session/export` | `POST` | Compiles evaluated batch records and rubric criteria into a downloadable UTF-8 BOM `.csv` spreadsheet. |
+
+---
+
+## System Requirements & Tech Stack
+
+* **Runtime Environment:** Node.js ($\ge 20.\text{x}$)
+* **Fullstack Framework:** SvelteKit 2 + Svelte 5 + TypeScript + Tailwind CSS
+* **Schema & Validation:** Zod (`GradingOutputSchema` + Structured JSON Schema)
+* **Database & ORM:** SQLite (Dev) / PostgreSQL (Prod) via Prisma ORM (`prisma/schema.prisma`)
+* **LLM Provider:** Google Gemini API (`gemini-2.5-flash` / `gemini-2.0-flash` with automatic fallback & exponential backoff retry)
 
 ---
 
@@ -114,7 +150,7 @@ Every evaluated document is strictly validated against the following payload con
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/username/rubrika.git
+   git clone https://github.com/logostelabauen/rubrika.git
    cd rubrika
    ```
 
@@ -123,25 +159,32 @@ Every evaluated document is strictly validated against the following payload con
    ```bash
    cp .env.example .env
    ```
-   Required variables inside `.env`:
+   Variables inside `.env`:
    ```env
    NODE_ENV=development
    PORT=3000
    DATABASE_URL="file:./dev.db"
-   LLM_API_KEY="your_api_key_here"
+   LLM_API_KEY="your_gemini_api_key_here"
+   GEMINI_MODEL="gemini-2.5-flash"
    SIMILARITY_THRESHOLD=0.80
    ```
 
-3. **Install Dependencies & Initialize Database**
+3. **Install Dependencies & Typecheck**
    ```bash
    npm install
-   npx prisma migrate dev
+   npm run check
    ```
 
-4. **Start the Development Server**
+4. **Initialize Database (Optional for Local Persistence)**
+   ```bash
+   npm run db:push
+   ```
+
+5. **Start the Development Server**
    ```bash
    npm run dev
    ```
+   Open `http://localhost:5173` in your browser. You can also configure or override the Gemini API key directly from the **⚙ Konfigurasi API Key** modal in the top navigation bar.
 
 ---
 
@@ -151,16 +194,34 @@ Every evaluated document is strictly validated against the following payload con
 rubrika/
 ├── src/
 │   ├── lib/
-│   │   ├── parser/          # PDF, DOCX, and ZIP extraction utilities
-│   │   ├── similarity/      # TF-IDF vectorizer & Cosine Similarity engine
-│   │   ├── grader/          # LLM prompt templates & JSON schema validators
-│   │   └── exporter/        # XLSX and CSV buffer generators
-│   ├── routes/              # Application UI & API endpoints
+│   │   ├── credits/         # Credit wallet guard, calibration quota, & QRIS top-up package
+│   │   ├── exporter/        # UTF-8 BOM CSV / Excel gradebook compiler
+│   │   ├── grader/          # System prompts, Zod schemas, Gemini evaluator, & batch worker pool
+│   │   │   ├── batch.ts
+│   │   │   ├── evaluator.ts
+│   │   │   ├── index.ts
+│   │   │   ├── prompt.ts
+│   │   │   └── schema.ts
+│   │   ├── parser/          # Local PDF, DOCX, TXT, and recursive ZIP extraction engine
+│   │   └── similarity/      # Unigram/Bigram TF-IDF vectorizer & Cosine Similarity engine
+│   ├── routes/
+│   │   ├── api/session/
+│   │   │   ├── calibrate/+server.ts
+│   │   │   ├── execute/+server.ts
+│   │   │   ├── export/+server.ts
+│   │   │   └── parse/+server.ts
+│   │   ├── +layout.svelte
+│   │   └── +page.svelte     # Interactive 4-Step Instructor Wizard UI
+│   ├── app.css
 │   └── app.html
 ├── prisma/
-│   └── schema.prisma        # Database schema definitions
+│   └── schema.prisma        # User, CreditTransaction, GradingSession, & Submission models
 ├── .env.example
 ├── package.json
+├── svelte.config.js
+├── tailwind.config.js
+├── tsconfig.json
+├── vite.config.ts
 └── README.md
 ```
 

@@ -250,6 +250,9 @@ rubrika/
 
 ## License
 
-Copyright (c) 2026 Lucas Weber. All rights reserved.
+Copyright (c) 2026 Lucas Weber.
 
-This software and its source code are proprietary. Unauthorized copying, modification, distribution, or commercial deployment of this software, via any medium, is strictly prohibited without prior written permission from the author.
+This project is open-source software licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** — see the [LICENSE](./LICENSE) file for full details.
+
+Under the terms of the AGPL-3.0, you are free to use, modify, and distribute this software, provided that any modified version or network-deployed service (SaaS) made available to users also makes its complete source code publicly available under the same license. For commercial or proprietary enterprise licensing without AGPL-3.0 copyleft obligations, please contact the author.
+
